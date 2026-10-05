@@ -16,11 +16,11 @@
   let wantPaused = false;
 
   function reportEnded() {
-    if (current.key === null) return;
-    fetch(`https://${location.hostname}/ended`, {
+    if (current.key === null || !current.resource) return;
+    fetch(`https://cfx-nui-${current.resource}/ended`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(current)
+      body: JSON.stringify({ key: current.key, seq: current.seq })
     }).catch(() => {});
   }
 
@@ -42,7 +42,7 @@
   function handle(d) {
     switch (d.action) {
       case 'play':
-        current = { key: d.key, seq: d.seq };
+        current = { key: d.key, seq: d.seq, resource: d.resource };
         wantPaused = !!d.paused;
         player.loadVideoById({ videoId: d.videoId, startSeconds: d.start || 0 });
         player.setVolume(d.volume ?? 0);
