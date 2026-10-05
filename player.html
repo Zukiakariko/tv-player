@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+  #player { width: 100%; height: 100%; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="player"></div>
+<script src="https://www.youtube.com/iframe_api"></script>
+<script>
+  let player = null, ready = false, queue = [];
+  let current = { key: null, seq: null };
+  let wantPaused = false;
+
+  function reportEnded() {
+    if (current.key === null) return;
+    fetch(`https://${location.hostname}/ended`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(current)
+    }).catch(() => {});
+  }
+
+  function onYouTubeIframeAPIReady() {
+    player = new YT.Player('player', {
+      width: '100%', height: '100%',
+      playerVars: { autoplay: 1, controls: 0, disablekb: 1, modestbranding: 1, rel: 0, playsinline: 1 },
+      events: {
+        onReady: () => { ready = true; queue.forEach(handle); queue = []; },
+        onStateChange: (e) => {
+          if (e.data === YT.PlayerState.ENDED) reportEnded();
+          if (e.data === YT.PlayerState.PLAYING && wantPaused) player.pauseVideo();
+        },
+        onError: () => reportEnded() // nicht abspielbar -> nächstes Video
+      }
+    });
+  }
+
+  function handle(d) {
+    switch (d.action) {
+      case 'play':
+        current = { key: d.key, seq: d.seq };
+        wantPaused = !!d.paused;
+        player.loadVideoById({ videoId: d.videoId, startSeconds: d.start || 0 });
+        player.setVolume(d.volume ?? 0);
+        break;
+      case 'state':
+        wantPaused = !!d.paused;
+        player.seekTo(d.time || 0, true);
+        if (wantPaused) player.pauseVideo(); else player.playVideo();
+        break;
+      case 'volume':
+        player.setVolume(Math.max(0, Math.min(100, d.volume)));
+        break;
+    }
+  }
+
+  window.addEventListener('message', (e) => {
+    if (!ready) { queue.push(e.data); return; }
+    handle(e.data);
+  });
+</script>
+</body>
+</html>
