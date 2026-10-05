@@ -42,6 +42,7 @@
   function handle(d) {
     switch (d.action) {
       case 'play':
+		if (current.key === d.key && current.seq === d.seq) break;
         current = { key: d.key, seq: d.seq, resource: d.resource };
         wantPaused = !!d.paused;
         player.loadVideoById({ videoId: d.videoId, startSeconds: d.start || 0 });
