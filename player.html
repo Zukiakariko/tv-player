@@ -4,19 +4,41 @@
 <meta charset="utf-8">
 <style>
   html, body { margin: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+  #ytwrap, #video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: none; pointer-events: none; }
+  #video { object-fit: contain; background: #000; }
   #player { width: 100%; height: 100%; pointer-events: none; }
 </style>
 </head>
 <body>
-<div id="player"></div>
+<div id="ytwrap"><div id="player"></div></div>
+<video id="video" playsinline preload="auto"></video>
+
 <script src="https://www.youtube.com/iframe_api"></script>
+<!-- Nur für .m3u8-Streams nötig. Version ist fest gepinnt. -->
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
 <script>
-  let player = null, ready = false, queue = [];
-  let current = { key: null, seq: null };
+  const video  = document.getElementById('video');
+  const ytwrap = document.getElementById('ytwrap');
+
+  let yt = null, ytReady = false, pendingYt = null;
+  let hls = null, hlsRetries = 0;
+  let videoLoaded = false, videoStart = 0;
+  let kind = null;                       // 'yt' | 'video'
+  let current = { key: null, seq: null, resource: null };
   let wantPaused = false;
+  let volume = 0;
+  let endedSent = false;
+
+  const clampVol = (v) => Math.max(0, Math.min(100, Number(v) || 0));
+
+  function show(which) {
+    ytwrap.style.display = which === 'yt' ? 'block' : 'none';
+    video.style.display  = which === 'video' ? 'block' : 'none';
+  }
 
   function reportEnded() {
-    if (current.key === null || !current.resource) return;
+    if (endedSent || current.key === null || !current.resource) return;
+    endedSent = true;
     fetch(`https://cfx-nui-${current.resource}/ended`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -24,44 +46,150 @@
     }).catch(() => {});
   }
 
+  // ---- YouTube --------------------------------------------------------------
   function onYouTubeIframeAPIReady() {
-    player = new YT.Player('player', {
+    yt = new YT.Player('player', {
       width: '100%', height: '100%',
       playerVars: { autoplay: 1, controls: 0, disablekb: 1, modestbranding: 1, rel: 0, playsinline: 1 },
       events: {
-        onReady: () => { ready = true; queue.forEach(handle); queue = []; },
-        onStateChange: (e) => {
-          if (e.data === YT.PlayerState.ENDED) reportEnded();
-          if (e.data === YT.PlayerState.PLAYING && wantPaused) player.pauseVideo();
+        onReady: () => {
+          ytReady = true;
+          if (pendingYt) { const p = pendingYt; pendingYt = null; startYt(p.id, p.start); }
         },
-        onError: () => reportEnded() // nicht abspielbar -> nächstes Video
+        onStateChange: (e) => {
+          if (kind !== 'yt') return;
+          if (e.data === YT.PlayerState.ENDED) reportEnded();
+          if (e.data === YT.PlayerState.PLAYING && wantPaused) yt.pauseVideo();
+        },
+        onError: () => { if (kind === 'yt') reportEnded(); } // nicht abspielbar -> nächstes Video
       }
     });
+  }
+
+  function startYt(id, start) {
+    yt.loadVideoById({ videoId: id, startSeconds: start || 0 });
+    yt.setVolume(volume);
+  }
+
+  // ---- Normales Video / HLS ------------------------------------------------
+  function tryPlay() {
+    const p = video.play();
+    if (p && p.catch) p.catch((err) => {
+      // Autoplay mit Ton blockiert -> wenigstens stumm abspielen
+      if (err && err.name === 'NotAllowedError') {
+        video.muted = true;
+        video.play().catch(() => {});
+      }
+    });
+  }
+
+  function startVideo(m, start) {
+    videoStart = start || 0;
+    videoLoaded = true;
+    hlsRetries = 0;
+    video.muted = false;
+    video.volume = volume / 100;
+
+    if (m.type === 'hls') {
+      if (window.Hls && Hls.isSupported()) {
+        hls = new Hls();
+        hls.on(Hls.Events.ERROR, (_, data) => {
+          if (!data.fatal) return;
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR && hlsRetries < 2) { hlsRetries++; hls.startLoad(); }
+          else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && hlsRetries < 2) { hlsRetries++; hls.recoverMediaError(); }
+          else reportEnded();
+        });
+        hls.loadSource(m.src);
+        hls.attachMedia(video);
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = m.src;
+      } else {
+        reportEnded();
+      }
+    } else {
+      video.src = m.src;
+    }
+  }
+
+  video.addEventListener('loadedmetadata', () => {
+    if (!videoLoaded) return;
+    // Zeitsprung nur bei Videos mit fester Länge (Livestreams haben keine)
+    if (videoStart > 0 && isFinite(video.duration)) {
+      if (videoStart >= video.duration - 0.5) { reportEnded(); return; } // wäre längst vorbei
+      video.currentTime = videoStart;
+    }
+    videoStart = 0;
+    if (!wantPaused) tryPlay();
+  });
+  video.addEventListener('playing', () => { if (wantPaused) video.pause(); });
+  video.addEventListener('ended',   () => { if (videoLoaded) reportEnded(); });
+  video.addEventListener('error',   () => { if (videoLoaded && !hls) reportEnded(); }); // bei HLS entscheidet hls.js
+
+  // ---- Steuerung ------------------------------------------------------------
+  function stopAll() {
+    pendingYt = null;
+    if (ytReady) { try { yt.stopVideo(); } catch (e) {} }
+    videoLoaded = false;
+    if (hls) { hls.destroy(); hls = null; }
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+  }
+
+  function play(d) {
+    if (current.key === d.key && current.seq === d.seq) return; // Wiederholte Nachricht
+    current = { key: d.key, seq: d.seq, resource: d.resource };
+    endedSent = false;
+    wantPaused = !!d.paused;
+    volume = clampVol(d.volume);
+    stopAll();
+
+    const m = d.media || {};
+    if (m.type === 'youtube') {
+      kind = 'yt';
+      show('yt');
+      if (ytReady) startYt(m.src, d.start); else pendingYt = { id: m.src, start: d.start };
+    } else if ((m.type === 'video' || m.type === 'hls') && /^https?:\/\//i.test(m.src || '')) {
+      kind = 'video';
+      show('video');
+      startVideo(m, d.start);
+    } else {
+      reportEnded();
+    }
+  }
+
+  function seek(t) {
+    if (kind === 'yt' && ytReady) {
+      yt.seekTo(t, true);
+    } else if (kind === 'video' && videoLoaded && video.readyState > 0 && isFinite(video.duration)) {
+      video.currentTime = Math.min(t, video.duration);
+    }
   }
 
   function handle(d) {
     switch (d.action) {
       case 'play':
-		if (current.key === d.key && current.seq === d.seq) break;
-        current = { key: d.key, seq: d.seq, resource: d.resource };
-        wantPaused = !!d.paused;
-        player.loadVideoById({ videoId: d.videoId, startSeconds: d.start || 0 });
-        player.setVolume(d.volume ?? 0);
+        play(d);
         break;
       case 'state':
         wantPaused = !!d.paused;
-        player.seekTo(d.time || 0, true);
-        if (wantPaused) player.pauseVideo(); else player.playVideo();
+        seek(d.time || 0);
+        if (kind === 'yt' && ytReady) {
+          if (wantPaused) yt.pauseVideo(); else yt.playVideo();
+        } else if (kind === 'video' && videoLoaded) {
+          if (wantPaused) video.pause(); else tryPlay();
+        }
         break;
       case 'volume':
-        player.setVolume(Math.max(0, Math.min(100, d.volume)));
+        volume = clampVol(d.volume);
+        if (kind === 'yt' && ytReady) yt.setVolume(volume);
+        else if (kind === 'video') video.volume = volume / 100;
         break;
     }
   }
 
   window.addEventListener('message', (e) => {
-    if (!ready) { queue.push(e.data); return; }
-    handle(e.data);
+    if (e.data && typeof e.data === 'object') handle(e.data);
   });
 </script>
 </body>
