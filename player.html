@@ -31,6 +31,34 @@
 
   const clampVol = (v) => Math.max(0, Math.min(100, Number(v) || 0));
 
+  // ---- Debug-Anzeige (nur wenn Config.Debug = true) -------------------------
+  let debugOn = false, dbgEl = null, dbgLines = [], stallTimer = null;
+
+  function dbg(msg) {
+    if (!debugOn) return;
+    if (!dbgEl) {
+      dbgEl = document.createElement('div');
+      dbgEl.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:10;padding:8px;' +
+        'font:22px/1.25 monospace;color:#0f0;background:rgba(0,0,0,.65);' +
+        'white-space:pre-wrap;word-break:break-all;pointer-events:none;';
+      document.body.appendChild(dbgEl);
+    }
+    dbgLines.push(msg);
+    if (dbgLines.length > 9) dbgLines.shift();
+    dbgEl.textContent = dbgLines.join('\n');
+  }
+
+  // Meldung an das Spiel (F8-Konsole), ohne das Video zu beenden
+  function logToGame(msg) {
+    dbg(msg);
+    if (current.key === null || !current.resource) return;
+    fetch(`https://cfx-nui-${current.resource}/log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ msg })
+    }).catch(() => {});
+  }
+
   function show(which) {
     ytwrap.style.display = which === 'yt' ? 'block' : 'none';
     video.style.display  = which === 'video' ? 'block' : 'none';
@@ -40,6 +68,7 @@
   function reportEnded(reason) {
     if (endedSent || current.key === null || !current.resource) return;
     endedSent = true;
+    if (reason) dbg('FEHLER: ' + reason);
     fetch(`https://cfx-nui-${current.resource}/ended`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -76,6 +105,7 @@
   function tryPlay() {
     const p = video.play();
     if (p && p.catch) p.catch((err) => {
+      logToGame('play() abgelehnt: ' + (err && err.name) + ' - ' + (err && err.message));
       // Autoplay mit Ton blockiert -> wenigstens stumm abspielen
       if (err && err.name === 'NotAllowedError') {
         video.muted = true;
@@ -90,6 +120,15 @@
     hlsRetries = 0;
     video.muted = false;
     video.volume = volume / 100;
+
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => {
+      if (videoLoaded && video.readyState === 0) {
+        logToGame('Nach 20 s noch keine Videodaten (networkState=' + video.networkState + '). ' +
+          'Mögliche Ursachen: Server langsam, Datei nicht streaming-optimiert (moov-Block am Ende) ' +
+          'oder Server ohne Range-Unterstützung.');
+      }
+    }, 20000);
 
     if (m.type === 'hls') {
       if (window.Hls && Hls.isSupported()) {
@@ -111,6 +150,13 @@
       video.src = m.src;
     }
   }
+
+  ['loadstart', 'loadedmetadata', 'loadeddata', 'canplay', 'playing', 'waiting', 'stalled', 'suspend', 'abort', 'emptied'].forEach((ev) => {
+    video.addEventListener(ev, () => {
+      if (videoLoaded) dbg(ev + '  rs=' + video.readyState + ' ns=' + video.networkState +
+        (isFinite(video.duration) ? ' dauer=' + Math.round(video.duration) + 's' : ''));
+    });
+  });
 
   video.addEventListener('loadedmetadata', () => {
     if (!videoLoaded) return;
@@ -141,6 +187,7 @@
     pendingYt = null;
     if (ytReady) { try { yt.stopVideo(); } catch (e) {} }
     videoLoaded = false;
+    clearTimeout(stallTimer);
     if (hls) { hls.destroy(); hls = null; }
     video.pause();
     video.removeAttribute('src');
@@ -151,6 +198,8 @@
     if (current.key === d.key && current.seq === d.seq) return; // Wiederholte Nachricht
     current = { key: d.key, seq: d.seq, resource: d.resource };
     endedSent = false;
+    debugOn = !!d.debug;
+    dbg('play empfangen: ' + ((d.media && d.media.type) || '?') + ' ' + ((d.media && d.media.src) || ''));
     wantPaused = !!d.paused;
     volume = clampVol(d.volume);
     stopAll();
