@@ -36,13 +36,14 @@
     video.style.display  = which === 'video' ? 'block' : 'none';
   }
 
-  function reportEnded() {
+  // reason: Fehlergrund (wird im Spiel angezeigt), leer = Video normal zu Ende
+  function reportEnded(reason) {
     if (endedSent || current.key === null || !current.resource) return;
     endedSent = true;
     fetch(`https://cfx-nui-${current.resource}/ended`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ key: current.key, seq: current.seq })
+      body: JSON.stringify({ key: current.key, seq: current.seq, reason: reason || null })
     }).catch(() => {});
   }
 
@@ -61,7 +62,7 @@
           if (e.data === YT.PlayerState.ENDED) reportEnded();
           if (e.data === YT.PlayerState.PLAYING && wantPaused) yt.pauseVideo();
         },
-        onError: () => { if (kind === 'yt') reportEnded(); } // nicht abspielbar -> nächstes Video
+        onError: (e) => { if (kind === 'yt') reportEnded('YouTube kann das Video nicht abspielen (Fehlercode ' + e.data + ').'); } // nicht abspielbar -> nächstes Video
       }
     });
   }
@@ -97,14 +98,14 @@
           if (!data.fatal) return;
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR && hlsRetries < 2) { hlsRetries++; hls.startLoad(); }
           else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && hlsRetries < 2) { hlsRetries++; hls.recoverMediaError(); }
-          else reportEnded();
+          else reportEnded('HLS-Stream konnte nicht geladen werden (' + data.details + ').');
         });
         hls.loadSource(m.src);
         hls.attachMedia(video);
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = m.src;
       } else {
-        reportEnded();
+        reportEnded('HLS wird vom Player nicht unterstützt (hls.js nicht geladen).');
       }
     } else {
       video.src = m.src;
@@ -123,7 +124,17 @@
   });
   video.addEventListener('playing', () => { if (wantPaused) video.pause(); });
   video.addEventListener('ended',   () => { if (videoLoaded) reportEnded(); });
-  video.addEventListener('error',   () => { if (videoLoaded && !hls) reportEnded(); }); // bei HLS entscheidet hls.js
+  video.addEventListener('error',   () => {                                   // bei HLS entscheidet hls.js
+    if (!videoLoaded || hls) return;
+    const code = video.error ? video.error.code : 0;
+    const texts = {
+      1: 'Wiedergabe abgebrochen.',
+      2: 'Netzwerkfehler beim Laden (Server nicht erreichbar oder Zugriff verweigert).',
+      3: 'Die Datei ist beschädigt oder der Codec wird nicht unterstützt.',
+      4: 'Die Datei wurde nicht gefunden, der Zugriff ist blockiert oder das Format/der Codec wird nicht unterstützt (z. B. H.265).',
+    };
+    reportEnded((texts[code] || 'Unbekannter Fehler.') + ' [Code ' + code + ']');
+  });
 
   // ---- Steuerung ------------------------------------------------------------
   function stopAll() {
@@ -149,12 +160,15 @@
       kind = 'yt';
       show('yt');
       if (ytReady) startYt(m.src, d.start); else pendingYt = { id: m.src, start: d.start };
+    } else if ((m.type === 'video' || m.type === 'hls') && location.protocol === 'https:' && /^http:\/\//i.test(m.src || '')) {
+      kind = 'video';
+      reportEnded('Die Videoadresse beginnt mit http://, der Player läuft aber über https. Der Browser blockiert das (Mixed Content). Das Video muss über https:// erreichbar sein.');
     } else if ((m.type === 'video' || m.type === 'hls') && /^https?:\/\//i.test(m.src || '')) {
       kind = 'video';
       show('video');
       startVideo(m, d.start);
     } else {
-      reportEnded();
+      reportEnded('Ungültige Videoquelle.');
     }
   }
 
